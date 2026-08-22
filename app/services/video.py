@@ -35,7 +35,7 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
-from app.services.utils import video_effects
+from app.services.utils import outro_render, subtitle_render, video_effects
 from app.utils import file_security, utils
 
 class SubClippedVideoClip:
@@ -988,6 +988,67 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+_OUTRO_FPS = 25
+# 角标按画面宽度取尺寸，1080 宽时约 300px，与平台头像的视觉比例接近。
+_OUTRO_LOGO_WIDTH_RATIO = 0.28
+
+
+def build_outro_clips(params: VideoParams, video_width: int, video_height: int,
+                      total_duration: float, font_path: str) -> list:
+    """
+    构造片尾"关注"角标的图像片段，叠加在正片最后一段上。
+
+    返回空列表表示本次不加角标：未启用、时长为 0、logo 缺失或正片过短。
+    正片短于角标两倍时直接放弃——在一条 5 秒的视频上盖 1.2 秒的关注提示，
+    观众几乎没看到内容就先看到了推广。
+    """
+    if not getattr(params, "outro_enabled", False):
+        return []
+
+    duration = float(getattr(params, "outro_duration", 0.0) or 0.0)
+    if duration <= 0 or total_duration < duration * 2:
+        if duration > 0:
+            logger.warning(
+                f"skipping outro: video is too short "
+                f"({total_duration:.1f}s) for a {duration:.1f}s badge"
+            )
+        return []
+
+    logo_path = getattr(params, "outro_logo_path", "") or ""
+    if not logo_path or not os.path.isfile(logo_path):
+        logger.warning(f"skipping outro: logo not found: {logo_path!r}")
+        return []
+
+    frames = outro_render.render_outro_frames(
+        logo_path=logo_path,
+        handle=getattr(params, "outro_handle", "") or "",
+        font_path=font_path,
+        accent_color=getattr(params, "outro_accent_color", "#FF2E88"),
+        logo_size=int(video_width * _OUTRO_LOGO_WIDTH_RATIO),
+        label=getattr(params, "outro_label", "FOLLOW") or "FOLLOW",
+        duration=duration,
+        fps=_OUTRO_FPS,
+    )
+    if not frames:
+        return []
+
+    start = total_duration - duration
+    step = duration / len(frames)
+    center_y = video_height * float(getattr(params, "outro_position", 0.30))
+
+    clips = []
+    for index, frame in enumerate(frames):
+        frame_start = start + index * step
+        # 最后一帧补到正片结尾，避免浮点累计误差留下一帧空隙。
+        frame_end = total_duration if index == len(frames) - 1 else frame_start + step
+        clip = ImageClip(frame, transparent=True, duration=max(0.01, frame_end - frame_start))
+        clip = clip.with_start(frame_start).with_end(frame_end)
+        clips.append(clip.with_position(("center", center_y - clip.h / 2)))
+
+    logger.info(f"  ⑥ outro: {os.path.basename(logo_path)} ({duration:.1f}s)")
+    return clips
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1034,6 +1095,57 @@ def generate_video(
         if isinstance(params.text_background_color, bool):
             return "#000000" if params.text_background_color else None
         return params.text_background_color
+
+    def position_subtitle_clip(clip):
+        """字幕定位逻辑对普通字幕和高亮字幕完全一致，抽出来避免两处维护。"""
+        if params.subtitle_position == "bottom":
+            return clip.with_position(("center", video_height * 0.95 - clip.h))
+        if params.subtitle_position == "top":
+            return clip.with_position(("center", video_height * 0.05))
+        if params.subtitle_position == "custom":
+            margin = 10
+            max_y = video_height - clip.h - margin
+            custom_y = (video_height - clip.h) * (params.custom_position / 100)
+            return clip.with_position(("center", max(margin, min(custom_y, max_y))))
+        return clip.with_position(("center", "center"))
+
+    def create_highlighted_clips(subtitle_item):
+        """
+        把一条字幕展开成"每个词轮流高亮"的一组图像片段。
+
+        逐词高亮无法用 TextClip 表达，因此改为自行绘制位图。每个词占用
+        一个时间片，画面内容相同，只有高亮位置不同。
+        """
+        (start, end), phrase = subtitle_item[0], subtitle_item[1]
+        words = phrase.split()
+        if not words:
+            return []
+
+        max_width = int(video_width * 0.86)
+        intervals = subtitle_render.split_word_intervals(words, start, end)
+        clips = []
+
+        for index, (word_start, word_end) in enumerate(intervals):
+            duration = max(0.01, word_end - word_start)
+            frame = subtitle_render.render_caption(
+                words=words,
+                active_index=index,
+                font_path=font_path,
+                font_size=int(params.font_size),
+                max_width=max_width,
+                text_color=params.text_fore_color,
+                stroke_color=params.stroke_color,
+                stroke_width=int(params.stroke_width),
+                highlight_color=getattr(
+                    params, "subtitle_highlight_color", "#FF2E88"
+                ),
+                uppercase=bool(getattr(params, "subtitle_uppercase", False)),
+            )
+            clip = ImageClip(frame, transparent=True, duration=duration)
+            clip = clip.with_start(word_start).with_end(word_end)
+            clips.append(position_subtitle_clip(clip))
+
+        return clips
 
     def create_text_clip(subtitle_item):
         params.font_size = int(params.font_size)
@@ -1223,11 +1335,29 @@ def generate_video(
                     make_textclip=make_textclip,
                 )
             )
+            highlight_enabled = bool(
+                getattr(params, "subtitle_highlight_enabled", False)
+            )
             text_clips = []
             for item in sub.subtitles:
-                clip = create_text_clip(subtitle_item=item)
-                text_clips.append(clip)
+                if highlight_enabled:
+                    # 高亮样式下每个词都要单独出一帧，因此一条字幕会展开成
+                    # 多个只有高亮位置不同的图像片段。
+                    text_clips.extend(create_highlighted_clips(subtitle_item=item))
+                else:
+                    text_clips.append(create_text_clip(subtitle_item=item))
             video_clip = CompositeVideoClip([video_clip, *text_clips])
+            clip_stack.callback(video_clip.close)
+
+        outro_clips = build_outro_clips(
+            params=params,
+            video_width=video_width,
+            video_height=video_height,
+            total_duration=video_clip.duration,
+            font_path=font_path or os.path.join(utils.font_dir(), "BeVietnamPro-Bold.ttf"),
+        )
+        if outro_clips:
+            video_clip = CompositeVideoClip([video_clip, *outro_clips])
             clip_stack.callback(video_clip.close)
 
         bgm_enabled = bgm_service.should_use_bgm(

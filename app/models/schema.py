@@ -111,9 +111,29 @@ class VideoParams(BaseModel):
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
     subtitle_enabled: Optional[bool] = True
+    # 每屏最多显示的词数。0 表示按标点断句（原有行为）；短视频常用 2-4 词，
+    # 仅对以空格分词的语言有意义。
+    max_subtitle_words: int = Field(default=0, ge=0, le=12)
+    # 逐词高亮：竖屏短视频常见样式，当前朗读的词加底色块。
+    subtitle_highlight_enabled: bool = False
+    subtitle_highlight_color: str = "#FF2E88"
+    subtitle_uppercase: bool = False
+    # 片尾"关注"角标。刻意叠加在正片最后一段而不是另起一段：额外的片尾会给
+    # 观众明确的"结束"信号，完播率与循环播放随之下降。
+    outro_enabled: bool = False
+    outro_logo_path: str = ""
+    outro_handle: str = ""
+    outro_label: str = "FOLLOW"
+    outro_accent_color: str = "#FF2E88"
+    outro_duration: float = Field(default=2.2, ge=0.0, le=8.0)
+    # 角标中心相对画面高度的位置。字幕居中显示时最高可占到 781~1139px，
+    # 因此默认值必须让角标整体收在 780px 以上，否则遇到需要折行的长词就会
+    # 与字幕叠在一起。
+    outro_position: float = Field(default=0.25, ge=0.0, le=1.0)
     subtitle_position: Optional[str] = config.ui.get(
         "subtitle_position", "bottom"
     )  # top, bottom, center, custom
+
     custom_position: float = config.ui.get("custom_position", 70.0)
     font_name: Optional[str] = "STHeitiMedium.ttc"
     text_fore_color: Optional[str] = "#FFFFFF"
@@ -148,6 +168,7 @@ class SubtitleRequest(BaseModel):
     stroke_width: float = 1.5
     video_source: Optional[str] = "local"
     subtitle_enabled: Optional[str] = "true"
+    max_subtitle_words: int = Field(default=0, ge=0, le=12)
 
 
 class AudioRequest(BaseModel):
