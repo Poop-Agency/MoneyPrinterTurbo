@@ -59,6 +59,12 @@ _LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
 _INTERRUPTED_CROSS_POST_ERROR = (
     "cross-posting was interrupted before the process completed"
 )
+# Map upload-post platform ids to the social platform names llm.py accepts.
+_CROSS_POST_SOCIAL_PLATFORMS = {
+    "tiktok": "tiktok",
+    "instagram": "instagram_reels",
+    "facebook": "facebook_reels",
+}
 # 视频配乐服务只需实现 ``is_enabled`` 和 ``generate_bgm``。供应商差异集中在
 # 文件扩展名、领域异常和 WebUI 警告代码；任务编排、0 音量短路及失败降级
 # 全部复用同一路径，避免后续新增供应商时维护多份相似流程。
@@ -351,7 +357,12 @@ def save_script_data(task_id, video_script, video_terms, params):
     task_artifacts.write_script_data(task_id, script_data)
 
 
-def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> str:
+def resolve_custom_audio_file(
+    task_id: str,
+    custom_audio_file: str | None,
+    *,
+    allow_server_file_input: bool = False,
+) -> str:
     requested_file = (custom_audio_file or "").strip()
     if not requested_file:
         return ""
@@ -364,6 +375,20 @@ def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> st
         )
     except ValueError as exc:
         task_dir_error = exc
+
+    # A missing path that otherwise stays inside the task directory is safe to
+    # report precisely. Paths outside that boundary use the same generic error
+    # regardless of whether they exist, so callers cannot probe the host filesystem.
+    if str(task_dir_error) == "file does not exist":
+        raise task_dir_error
+
+    # HTTP requests and other untrusted callers must never turn a submitted path
+    # into a server-side file read. WebUI uploads already live in the task directory;
+    # only the local CLI explicitly opts into resolving files elsewhere on the host.
+    if not allow_server_file_input:
+        raise ValueError(
+            "custom audio file must be stored within the current task directory"
+        ) from task_dir_error
 
     server_audio_file = path.realpath(
         requested_file
@@ -450,7 +475,14 @@ def _resolve_reusable_voice_preview(
     return preview_file, math.ceil(duration), sub_maker
 
 
-def generate_audio(task_id, params, video_script, voice_preview=None):
+def generate_audio(
+    task_id,
+    params,
+    video_script,
+    voice_preview=None,
+    *,
+    allow_server_file_input: bool = False,
+):
     """
     Generate audio for the video script.
     If a custom audio file is provided, it will be used directly.
@@ -467,7 +499,9 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
     requested_custom_audio_file = getattr(params, "custom_audio_file", None)
     try:
         custom_audio_file = resolve_custom_audio_file(
-            task_id, requested_custom_audio_file
+            task_id,
+            requested_custom_audio_file,
+            allow_server_file_input=allow_server_file_input,
         )
     except ValueError as exc:
         _mark_task_failed(
@@ -997,25 +1031,39 @@ def _run_cross_post(
             f"cross-post started, task_id: {task_id}, platforms: {', '.join(platforms)}"
         )
         youtube_extra = None
-        if any(platform.startswith("youtube") for platform in platforms):
+        post_title = video_subject or "Check out this video! #shorts #viral"
+        if platforms:
+            has_youtube = any(platform.startswith("youtube") for platform in platforms)
+            social_platform = "youtube_shorts"
+            if not has_youtube:
+                first = (platforms[0] or "").strip().lower()
+                # llm.py resolves unknown ids to its default platform.
+                social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(first, first)
             metadata = llm.generate_social_metadata(
                 video_subject=video_subject,
                 video_script=video_script,
                 language=video_language or "",
-                platform="youtube_shorts",
+                platform=social_platform,
             )
-            youtube_extra = {
-                "youtube_title": metadata.get("title", video_subject),
-                "youtube_description": metadata.get("caption", ""),
-                "tags": metadata.get("hashtags", []),
-                "privacyStatus": youtube_privacy_status,
-                "containsSyntheticMedia": True,
-            }
+            if has_youtube:
+                youtube_extra = {
+                    "youtube_title": metadata.get("title", video_subject),
+                    "youtube_description": metadata.get("caption", ""),
+                    "tags": metadata.get("hashtags", []),
+                    "privacyStatus": youtube_privacy_status,
+                    "containsSyntheticMedia": True,
+                }
+            post_title = (
+                metadata.get("caption")
+                or metadata.get("title")
+                or video_subject
+                or "Check out this video! #shorts #viral"
+            )
 
         for video_path in video_paths:
             result = upload_post.cross_post_video(
                 video_path=video_path,
-                title=video_subject or "Check out this video! #shorts #viral",
+                title=post_title,
                 platforms=list(platforms),
                 youtube_extra=youtube_extra,
             )
@@ -1179,6 +1227,7 @@ def _run_pipeline(
     stop_at: str = "video",
     voice_preview: dict | None = None,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    allow_server_file_input: bool = False,
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
@@ -1221,6 +1270,18 @@ def _run_pipeline(
                 validate_access()
             except video_music_provider["error_type"] as exc:
                 return _mark_task_failed(task_id, "preflight", str(exc))
+
+    # 只有 script/terms 中间产物不需要 FFmpeg（它们不生成音频或视频）。API、
+    # CLI 和 WebUI 都通过这个共享入口执行任务，因此在此统一探测，而不是
+    # 分别在各个入口重复检查，能保证三条路径的行为一致。放在配乐 Key 校验
+    # 之后，是为了不改变那些校验原有的"最先失败"顺序和错误信息。
+    if stop_at not in ("script", "terms") and not utils.check_ffmpeg_ready():
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "ffmpeg is not available; install ffmpeg or set app.ffmpeg_path "
+            "in config.toml to a working ffmpeg executable",
+        )
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
@@ -1267,6 +1328,7 @@ def _run_pipeline(
         params,
         video_script,
         voice_preview=voice_preview,
+        allow_server_file_input=allow_server_file_input,
     )
     if not audio_file:
         return _mark_task_failed(
@@ -1418,8 +1480,14 @@ def start(
     stop_at: str = "video",
     voice_preview: dict | None = None,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    allow_server_file_input: bool = False,
 ):
-    """执行任务流水线，并确保未预期异常也会转换成可查询的失败状态。"""
+    """
+    执行任务流水线，并确保未预期异常也会转换成可查询的失败状态。
+
+    ``allow_server_file_input`` 只供本机 CLI 使用。HTTP API 和 WebUI 必须保持
+    默认值，让自定义音频始终受当前任务目录约束。
+    """
     try:
         # 主机级互斥：WebUI、CLI 和 API 属于不同进程，各自的队列互不可见。
         # 只有在这里统一加锁，才能保证同一台机器上不会有两条流水线同时
@@ -1431,6 +1499,7 @@ def start(
                 stop_at=stop_at,
                 voice_preview=voice_preview,
                 loomloom_video_request=loomloom_video_request,
+                allow_server_file_input=allow_server_file_input,
             )
     except generation_lock.GenerationBusyError as exc:
         # 并发被拒绝属于可预期结果，不需要记录异常堆栈。调用方需要把它与
